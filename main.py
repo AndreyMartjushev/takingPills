@@ -12,6 +12,7 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.utils.exceptions import MessageCantBeDeleted
+from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
 from db import db_query, init_db_pool
 
@@ -82,13 +83,13 @@ DAY_PERIOD_PRESETS = [
 ]
 
 PAUSE_DURATION_OPTIONS = [
-    ("1w", "1 неделя", timedelta(weeks=1)),
-    ("2w", "2 недели", timedelta(weeks=2)),
-    ("3w", "3 недели", timedelta(weeks=3)),
-    ("4w", "4 недели", timedelta(weeks=4)),
-    ("1m", "1 месяц", timedelta(days=30)),
-    ("2m", "2 месяца", timedelta(days=60)),
-    ("3m", "3 месяца", timedelta(days=90)),
+    ("1w", "1 неделя", relativedelta(weeks=1)),
+    ("2w", "2 недели", relativedelta(weeks=2)),
+    ("3w", "3 недели", relativedelta(weeks=3)),
+    ("4w", "4 недели", relativedelta(weeks=4)),
+    ("1m", "1 месяц", relativedelta(months=1)),
+    ("2m", "2 месяца", relativedelta(months=2)),
+    ("3m", "3 месяца", relativedelta(months=3)),
 ]
 PAUSE_DURATION_MAP = {key: (label, delta) for key, label, delta in PAUSE_DURATION_OPTIONS}
 
@@ -1285,7 +1286,7 @@ async def callback_set_language(call: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("med:edit:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("med:edit:"), state="*")
 async def callback_edit_medication(call: types.CallbackQuery, state: FSMContext):
     _, _, med_id_str = call.data.split(":")
     med_id = int(med_id_str)
@@ -1318,7 +1319,7 @@ async def callback_edit_medication(call: types.CallbackQuery, state: FSMContext)
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("med:delete:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("med:delete:"), state="*")
 async def callback_delete_medication(call: types.CallbackQuery):
     _, _, med_id_str = call.data.split(":")
     med_id = int(med_id_str)
@@ -1334,12 +1335,15 @@ async def callback_delete_medication(call: types.CallbackQuery):
         return
 
     keyboard = types.InlineKeyboardMarkup()
+    original_msg_id = call.message.message_id
     keyboard.add(
         types.InlineKeyboardButton(
-            text="✅ Да, удалить", callback_data=f"med:delete_confirm:{med_id}:yes"
+            text="✅ Да, удалить",
+            callback_data=f"med:delete_confirm:{med_id}:{original_msg_id}:yes",
         ),
         types.InlineKeyboardButton(
-            text="↩️ Оставить", callback_data=f"med:delete_confirm:{med_id}:no"
+            text="↩️ Оставить",
+            callback_data=f"med:delete_confirm:{med_id}:{original_msg_id}:no",
         ),
     )
     await call.answer()
@@ -1350,10 +1354,11 @@ async def callback_delete_medication(call: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("med:delete_confirm:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("med:delete_confirm:"), state="*")
 async def callback_delete_confirm(call: types.CallbackQuery):
-    _, _, med_id_str, choice = call.data.split(":")
+    _, _, med_id_str, original_msg_id_str, choice = call.data.split(":")
     med_id = int(med_id_str)
+    original_msg_id = int(original_msg_id_str)
     user = get_user_by_telegram(call.from_user.id)
     if not user:
         await call.answer("Сначала отправь /start", show_alert=True)
@@ -1366,21 +1371,15 @@ async def callback_delete_confirm(call: types.CallbackQuery):
 
     await call.answer()
 
+    chat_id = call.message.chat.id
+
     if choice == "no":
-        await call.message.edit_reply_markup(
-            reply_markup=build_med_actions_keyboard(med)
-        )
+        await safe_delete_message(chat_id, call.message.message_id)
         await call.message.answer("Оставили без изменений.")
         return
 
-    try:
-        await call.message.delete()
-    except MessageCantBeDeleted:
-        await call.message.edit_reply_markup(reply_markup=None)
-        logger.warning(
-            "Cannot delete message with medication card",
-            extra={"med_id": med_id, "user_id": user["id"]},
-        )
+    await safe_delete_message(chat_id, original_msg_id)
+    await safe_delete_message(chat_id, call.message.message_id)
 
     delete_medication(med_id, user["id"])
     logger.info(
@@ -1393,13 +1392,13 @@ async def callback_delete_confirm(call: types.CallbackQuery):
         reply_markup=get_main_reply_keyboard(has_meds),
     )
 
-@dp.callback_query_handler(lambda c: c.data == "close:pause_menu")
+@dp.callback_query_handler(lambda c: c.data == "close:pause_menu", state="*")
 async def callback_close_pause(call: types.CallbackQuery):
     await call.answer()
     await call.message.edit_reply_markup(reply_markup=None)
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("med:pauseprompt:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("med:pauseprompt:"), state="*")
 async def callback_pause_prompt(call: types.CallbackQuery):
     _, _, med_id_str = call.data.split(":")
     med_id = int(med_id_str)
@@ -1422,7 +1421,7 @@ async def callback_pause_prompt(call: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("med:pause:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("med:pause:"), state="*")
 async def callback_pause_med(call: types.CallbackQuery):
     try:
         _, _, med_id_str, option = call.data.split(":")
@@ -1459,7 +1458,7 @@ async def callback_pause_med(call: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("med:resume:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("med:resume:"), state="*")
 async def callback_resume_med(call: types.CallbackQuery):
     _, _, med_id_str = call.data.split(":")
     med_id = int(med_id_str)
@@ -1486,7 +1485,7 @@ async def callback_resume_med(call: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("snoozeopt:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("snoozeopt:"), state="*")
 async def callback_snooze_option(call: types.CallbackQuery):
     try:
         _, intake_id_str, minutes_str = call.data.split(":")
@@ -1534,7 +1533,7 @@ async def callback_snooze_option(call: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("snoozeback:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("snoozeback:"), state="*")
 async def callback_snooze_back(call: types.CallbackQuery):
     try:
         _, intake_id_str = call.data.split(":")
@@ -1560,7 +1559,7 @@ async def callback_snooze_back(call: types.CallbackQuery):
         reply_markup=build_intake_action_keyboard(intake_id)
     )
 
-@dp.callback_query_handler(lambda c: c.data.startswith("med:toggle:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("med:toggle:"), state="*")
 async def callback_toggle_medication(call: types.CallbackQuery):
     _, _, med_id_str = call.data.split(":")
     med_id = int(med_id_str)
