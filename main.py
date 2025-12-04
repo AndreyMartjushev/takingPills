@@ -77,6 +77,17 @@ DAY_PERIOD_PRESETS = [
     {"key": "night", "title": "🌙 Поздний вечер", "time": dtime(hour=22, minute=30)},
 ]
 
+PAUSE_DURATION_OPTIONS = [
+    ("1w", "1 неделя", timedelta(weeks=1)),
+    ("2w", "2 недели", timedelta(weeks=2)),
+    ("3w", "3 недели", timedelta(weeks=3)),
+    ("4w", "4 недели", timedelta(weeks=4)),
+    ("1m", "1 месяц", timedelta(days=30)),
+    ("2m", "2 месяца", timedelta(days=60)),
+    ("3m", "3 месяца", timedelta(days=90)),
+]
+PAUSE_DURATION_MAP = {key: (label, delta) for key, label, delta in PAUSE_DURATION_OPTIONS}
+
 HELP_TEXTS = {
     "ru": (
         "Доступные команды:\n"
@@ -211,6 +222,12 @@ def to_local(dt: datetime, zone: ZoneInfo) -> datetime:
     return dt.astimezone(zone)
 
 
+def format_local_dt(dt: Optional[datetime], zone: ZoneInfo) -> str:
+    if not dt:
+        return "-"
+    return to_local(dt, zone).strftime("%d.%m %H:%M")
+
+
 async def notify_admin(text: str):
     if not ADMIN_CHAT_ID:
         return
@@ -338,6 +355,54 @@ def build_intake_action_keyboard(intake_id: int):
         types.InlineKeyboardButton(
             text="🚫 Не напоминать", callback_data=f"skip:{intake_id}"
         )
+    )
+    return keyboard
+
+
+def format_intake_table(times: list[str], statuses: list[str]) -> str:
+    if not times:
+        times = ["—"]
+        statuses = ["—"]
+    time_row = " | ".join(f"{t:^7}" for t in times)
+    status_row = " | ".join(f"{s:^7}" for s in statuses)
+    return f"```\n{time_row}\n{status_row}\n```"
+
+
+def build_med_actions_keyboard(med: dict):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="🔧 Расписание/дозы", callback_data=f"med:edit:{med['id']}"
+        ),
+        types.InlineKeyboardButton(
+            text="🗑 Удалить", callback_data=f"med:delete:{med['id']}"
+        ),
+    )
+    if med["is_active"]:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text="⏸ Приостановить", callback_data=f"med:pauseprompt:{med['id']}"
+            )
+        )
+    else:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text="▶️ Возобновить", callback_data=f"med:resume:{med['id']}"
+            )
+        )
+    return keyboard
+
+
+def build_pause_duration_keyboard(med_id: int):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    for key, label, _ in PAUSE_DURATION_OPTIONS:
+        keyboard.insert(
+            types.InlineKeyboardButton(
+                text=label, callback_data=f"med:pause:{med_id}:{key}"
+            )
+        )
+    keyboard.add(
+        types.InlineKeyboardButton(text="↩️ Отмена", callback_data="close:pause_menu")
     )
     return keyboard
 
@@ -485,10 +550,17 @@ def clear_future_intakes(med_id: int, from_dt: Optional[datetime] = None):
     )
 
 
-def set_medication_active(med_id: int, user_id: int, active: bool):
+def set_medication_active(
+    med_id: int, user_id: int, active: bool, paused_until: Optional[datetime] = None
+):
     db_query(
-        "UPDATE medications SET is_active = %s WHERE id = %s AND user_id = %s",
-        (active, med_id, user_id),
+        """
+        UPDATE medications
+           SET is_active = %s,
+               paused_until = %s
+         WHERE id = %s AND user_id = %s
+        """,
+        (active, None if active else paused_until, med_id, user_id),
     )
 
 
@@ -941,11 +1013,17 @@ async def cmd_list(message: types.Message):
         )
         return
 
-    lines = []
     zone = get_zone_for_user(user)
     today_local = get_local_today(zone)
     now_utc = datetime.now(timezone.utc)
     remind_before = get_remind_before(user)
+    header = (
+        f"Всего активных лекарств: {len(meds)}\n"
+        f"Часовой пояс: {user.get('timezone') or DEFAULT_TZ_NAME}\n"
+        f"Напоминаю за {remind_before} мин. до приёма."
+    )
+    await message.answer(header, reply_markup=get_main_reply_keyboard(True))
+
     for med in meds:
         intakes = get_intakes_for_day(med["id"], today_local, zone)
         total = len(intakes)
@@ -953,35 +1031,33 @@ async def cmd_list(message: types.Message):
         overdue = sum(
             1 for i in intakes if not i["taken"] and i["scheduled_at"] < now_utc
         )
-        display_times = med["times"] or [
-            to_local(i["scheduled_at"], zone).strftime("%H:%M") for i in intakes
-        ]
-        if not display_times:
-            display_times = ["—"]
-        status_map = {
-            to_local(i["scheduled_at"], zone).strftime("%H:%M"): "✅"
-            if i["taken"]
-            else "❌"
-        }
-        time_row = " | ".join(f"{t:^5}" for t in display_times)
-        status_row = " | ".join(status_map.get(t, "❌").center(5) for t in display_times)
-        table = f"```\n{time_row}\n{status_row}\n```"
-        lines.append(f"💊 *{med['name']}*\n{table}")
+        if intakes:
+            display_times = [
+                to_local(i["scheduled_at"], zone).strftime("%H:%M") for i in intakes
+            ]
+            status_symbols = ["✅" if i["taken"] else "❌" for i in intakes]
+        else:
+            display_times = med["times"] or ["—"]
+            status_symbols = ["—"] * len(display_times)
+
+        table = format_intake_table(display_times, status_symbols)
         summary = f"Сегодня: {taken}/{total}"
         if overdue:
             summary += f" (просрочено {overdue})"
-        lines.append(summary)
-        lines.append("")
-
-    lines.append(
-        f"Часовой пояс: {user.get('timezone') or DEFAULT_TZ_NAME}, "
-        f"напоминаю за {remind_before} мин."
-    )
-    await message.answer(
-        "\n".join(line for line in lines if line),
-        parse_mode="Markdown",
-        reply_markup=get_main_reply_keyboard(True),
-    )
+        if med["is_active"]:
+            status_line = "Статус: 🟢 активно"
+        else:
+            if med.get("paused_until"):
+                local_until = format_local_dt(med["paused_until"], zone)
+                status_line = f"Статус: ⏸ до {local_until}"
+            else:
+                status_line = "Статус: ⏸ на паузе"
+        text = f"💊 *{med['name']}*\n{table}\n{summary}\n{status_line}"
+        await message.answer(
+            text,
+            parse_mode="Markdown",
+            reply_markup=build_med_actions_keyboard(med),
+        )
 
 
 @dp.message_handler(lambda message: message.text == STATS_BUTTON)
@@ -1022,30 +1098,26 @@ async def cmd_manage_meds(message: types.Message):
         intakes = get_intakes_for_day(med["id"], today_local, zone)
         total = len(intakes)
         taken = sum(1 for i in intakes if i["taken"])
-        status_text = "🟢 Активно" if med["is_active"] else "⏸ На паузе"
+        display_times = [
+            to_local(i["scheduled_at"], zone).strftime("%H:%M") for i in intakes
+        ]
+        statuses = ["✅" if i["taken"] else "❌" for i in intakes]
+        table = format_intake_table(display_times, statuses)
+        if med["is_active"]:
+            status_text = "🟢 Активно"
+        else:
+            if med.get("paused_until"):
+                status_text = f"⏸ До {format_local_dt(med['paused_until'], zone)}"
+            else:
+                status_text = "⏸ На паузе"
         text = (
             f"💊 *{med['name']}*\n"
-            f"Расписание: {format_med_schedule(med)}\n"
+            f"{table}\n"
             f"Сегодня: {taken}/{total}\n"
             f"Статус: {status_text}"
         )
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(
-            types.InlineKeyboardButton(
-                text="📝 Изменить", callback_data=f"med:edit:{med['id']}"
-            ),
-            types.InlineKeyboardButton(
-                text="🗑 Удалить", callback_data=f"med:delete:{med['id']}"
-            ),
-        )
-        toggle_label = "⏸ Пауза" if med["is_active"] else "▶️ Возобновить"
-        keyboard.add(
-            types.InlineKeyboardButton(
-                text=toggle_label, callback_data=f"med:toggle:{med['id']}"
-            )
-        )
         await message.answer(
-            text, parse_mode="Markdown", reply_markup=keyboard
+            text, parse_mode="Markdown", reply_markup=build_med_actions_keyboard(med)
         )
 
 
@@ -1248,6 +1320,98 @@ async def callback_delete_confirm(call: types.CallbackQuery):
         reply_markup=get_main_reply_keyboard(has_meds),
     )
 
+@dp.callback_query_handler(lambda c: c.data == "close:pause_menu")
+async def callback_close_pause(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.edit_reply_markup(reply_markup=None)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("med:pauseprompt:"))
+async def callback_pause_prompt(call: types.CallbackQuery):
+    _, _, med_id_str = call.data.split(":")
+    med_id = int(med_id_str)
+    user = get_user_by_telegram(call.from_user.id)
+    if not user:
+        await call.answer("Сначала отправь /start", show_alert=True)
+        return
+    med = get_med_by_id(med_id)
+    if not med or med["user_id"] != user["id"]:
+        await call.answer("Лекарство не найдено.", show_alert=True)
+        return
+    if not med["is_active"]:
+        await call.answer("Лекарство уже на паузе.", show_alert=True)
+        return
+    await call.answer()
+    await call.message.answer(
+        f"На сколько поставить *{med['name']}* на паузу?",
+        parse_mode="Markdown",
+        reply_markup=build_pause_duration_keyboard(med_id),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("med:pause:"))
+async def callback_pause_med(call: types.CallbackQuery):
+    try:
+        _, _, med_id_str, option = call.data.split(":")
+        med_id = int(med_id_str)
+    except ValueError:
+        await call.answer("Неверные данные.", show_alert=True)
+        return
+
+    user = get_user_by_telegram(call.from_user.id)
+    if not user:
+        await call.answer("Сначала отправь /start", show_alert=True)
+        return
+    med = get_med_by_id(med_id)
+    if not med or med["user_id"] != user["id"]:
+        await call.answer("Лекарство не найдено.", show_alert=True)
+        return
+    if option not in PAUSE_DURATION_MAP:
+        await call.answer("Неизвестный период.", show_alert=True)
+        return
+
+    label, delta = PAUSE_DURATION_MAP[option]
+    until = datetime.now(timezone.utc) + delta
+    set_medication_active(med_id, user["id"], False, paused_until=until)
+    logger.info(
+        "Medication paused",
+        extra={"med_id": med_id, "user_id": user["id"], "until": until.isoformat()},
+    )
+    await call.answer()
+    zone = get_zone_for_user(user)
+    await call.message.answer(
+        f"Поставил *{med['name']}* на паузу на {label} (до {format_local_dt(until, zone)}).\n"
+        "Когда срок закончится — пришлю напоминание и возобновлю курс.",
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("med:resume:"))
+async def callback_resume_med(call: types.CallbackQuery):
+    _, _, med_id_str = call.data.split(":")
+    med_id = int(med_id_str)
+    user = get_user_by_telegram(call.from_user.id)
+    if not user:
+        await call.answer("Сначала отправь /start", show_alert=True)
+        return
+    med = get_med_by_id(med_id)
+    if not med or med["user_id"] != user["id"]:
+        await call.answer("Лекарство не найдено.", show_alert=True)
+        return
+    if med["is_active"]:
+        await call.answer("Уже активно.", show_alert=True)
+        return
+
+    set_medication_active(med_id, user["id"], True)
+    clear_future_intakes(med_id)
+    logger.info("Medication resumed", extra={"med_id": med_id, "user_id": user["id"]})
+    await call.answer()
+    await call.message.answer(
+        f"Возобновил *{med['name']}*. Расписание осталось тем же.",
+        parse_mode="Markdown",
+        reply_markup=get_main_reply_keyboard(bool(get_user_medications(user["id"]))),
+    )
+
 
 @dp.callback_query_handler(lambda c: c.data.startswith("med:toggle:"))
 async def callback_toggle_medication(call: types.CallbackQuery):
@@ -1320,12 +1484,13 @@ async def callback_take_all(call: types.CallbackQuery):
     intakes = get_intakes_for_day(med_id, today_local, zone)
     pending = [i for i in intakes if not i["taken"]]
     if not pending:
-        await call.answer("Все приёмы уже отмечены ✅", show_alert=True)
+        await call.answer()
         await call.message.edit_reply_markup(
             reply_markup=build_today_progress_keyboard(
                 med, intakes, zone, include_mark_all=False
             )
         )
+        await call.message.answer(f"Все приёмы для {med['name']} уже отмечены ✅")
         return
 
     for intake in pending:
@@ -1337,7 +1502,8 @@ async def callback_take_all(call: types.CallbackQuery):
         med, updated, zone, include_mark_all=False
     )
     await call.message.edit_reply_markup(reply_markup=keyboard)
-    await call.answer("Отметил все приёмы для лекарства ✅", show_alert=True)
+    await call.answer()
+    await call.message.answer(f"Отметил все приёмы для {med['name']} ✅")
 
 
 @dp.message_handler(commands=["daily"])
@@ -1383,6 +1549,7 @@ async def callback_intake_actions(call: types.CallbackQuery):
 
     zone = get_zone_for_user(user)
     today_local = get_local_today(zone)
+    intake_time_local = to_local(intake["scheduled_at"], zone).strftime("%H:%M")
 
     if action == "take":
         if intake["taken"]:
@@ -1390,7 +1557,10 @@ async def callback_intake_actions(call: types.CallbackQuery):
             return
         mark_intake_taken(intake_id)
         METRICS["intakes_marked"] += 1
-        await call.answer("Отметил как принял(а) ✅", show_alert=True)
+        await call.answer()
+        await call.message.answer(
+            f"Отметил приём {med['name']} в {intake_time_local} ✅"
+        )
         intakes_today = get_intakes_for_day(med["id"], today_local, zone)
         if call.message and call.message.text and "Выбери приём" in call.message.text:
             keyboard = build_today_progress_keyboard(
@@ -1407,12 +1577,18 @@ async def callback_intake_actions(call: types.CallbackQuery):
             return
         snooze_intake(intake_id)
         METRICS["snoozes"] += 1
-        await call.answer("Напомню через 15 минут ⏰")
+        await call.answer()
+        await call.message.answer(
+            f"Напомню про {med['name']} ({intake_time_local}) через {SNOOZE_MINUTES} минут ⏰"
+        )
         return
 
     if action == "skip":
         pause_intake_reminders(intake_id)
-        await call.answer("Напоминания для этого приёма отключены.", show_alert=True)
+        await call.answer()
+        await call.message.answer(
+            f"Больше не буду напоминать про {med['name']} в {intake_time_local}."
+        )
         await call.message.edit_reply_markup(reply_markup=None)
 
 
@@ -1423,11 +1599,52 @@ async def reminder_loop():
     """
     while True:
         try:
+            await resume_due_medications()
             await check_and_send_reminders()
         except Exception as e:
             logger.exception("Error in reminder_loop: %s", e)
             await notify_admin("Фоновый цикл напоминаний упал")
         await asyncio.sleep(60)
+
+
+async def resume_due_medications():
+    now_utc = datetime.now(timezone.utc)
+    rows = db_query(
+        """
+        SELECT m.id,
+               m.name,
+               m.user_id,
+               u.telegram_id,
+               u.timezone
+          FROM medications m
+          JOIN users u ON u.id = m.user_id
+         WHERE m.is_active = FALSE
+           AND m.paused_until IS NOT NULL
+           AND m.paused_until <= %s
+        """,
+        (now_utc,),
+        fetchall=True,
+    ) or []
+    for med in rows:
+        set_medication_active(med["id"], med["user_id"], True)
+        clear_future_intakes(med["id"])
+        zone = resolve_timezone(med.get("timezone"))
+        try:
+            await bot.send_message(
+                med["telegram_id"],
+                f"Возобновил *{med['name']}* — продолжаем курс 💊",
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to notify resume",
+                extra={"med_id": med["id"], "user_id": med["user_id"]},
+                exc_info=exc,
+            )
+        logger.info(
+            "Medication auto-resumed",
+            extra={"med_id": med["id"], "user_id": med["user_id"]},
+        )
 
 
 async def check_and_send_reminders():

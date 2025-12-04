@@ -49,6 +49,7 @@
 - `001_initial.sql` — первичное создание таблиц.
 - `002_add_language.sql` — добавляет колонку `language` в `users`.
 - `003_add_remind_before.sql` — добавляет настройку `remind_before_minutes`.
+- `004_add_paused_until.sql` — даёт `medications` дату автоматического возобновления курса (`paused_until`).
 
 ## Основные возможности
 
