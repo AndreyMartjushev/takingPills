@@ -11,6 +11,7 @@ from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.utils.exceptions import MessageCantBeDeleted
 from dotenv import load_dotenv
 from db import db_query, init_db_pool
 
@@ -126,6 +127,7 @@ METRICS = {
     "snoozes": 0,
     "missed": 0,
 }
+SNOOZE_PROMPTS: Dict[int, int] = {}
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -266,6 +268,22 @@ def format_med_schedule(med) -> str:
             formatted.append(format_period_label(label, t))
         return ", ".join(formatted) if formatted else "—"
     return ", ".join(times) if times else "—"
+
+
+async def safe_delete_message(chat_id: int, message_id: int):
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except MessageCantBeDeleted:
+        logger.debug(
+            "Cannot delete message",
+            extra={"chat_id": chat_id, "message_id": message_id},
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to delete message",
+            exc_info=exc,
+            extra={"chat_id": chat_id, "message_id": message_id},
+        )
 
 
 def build_schedule_type_keyboard():
@@ -824,6 +842,16 @@ async def handle_manual_mark_button(message: types.Message, state: FSMContext):
         await message.answer("На сегодня всё отмечено 🙌")
 
 
+@dp.message_handler(commands=["list"], state="*")
+async def cmd_list(message: types.Message, state: FSMContext):
+    await send_list_overview(message)
+
+
+@dp.message_handler(lambda message: message.text == STATS_BUTTON, state="*")
+async def handle_stats_button(message: types.Message, state: FSMContext):
+    await send_list_overview(message)
+
+
 @dp.message_handler(state=AddMedStates.waiting_for_name)
 async def add_med_name(message: types.Message, state: FSMContext):
     name = (message.text or "").strip()
@@ -1025,8 +1053,7 @@ async def add_more_medications(call: types.CallbackQuery, state: FSMContext):
     )
 
 
-@dp.message_handler(commands=["list"])
-async def cmd_list(message: types.Message):
+async def send_list_overview(message: types.Message):
     user = get_user_by_telegram(message.from_user.id)
     if not user:
         await message.answer("Сначала отправь /start")
@@ -1092,11 +1119,6 @@ async def cmd_list(message: types.Message):
             parse_mode="HTML",
             reply_markup=build_med_actions_keyboard(med),
         )
-
-
-@dp.message_handler(lambda message: message.text == STATS_BUTTON)
-async def handle_stats_button(message: types.Message):
-    await cmd_list(message)
 
 
 @dp.message_handler(commands=["help"])
@@ -1343,11 +1365,22 @@ async def callback_delete_confirm(call: types.CallbackQuery):
         return
 
     await call.answer()
-    await call.message.edit_reply_markup(reply_markup=None)
 
     if choice == "no":
+        await call.message.edit_reply_markup(
+            reply_markup=build_med_actions_keyboard(med)
+        )
         await call.message.answer("Оставили без изменений.")
         return
+
+    try:
+        await call.message.delete()
+    except MessageCantBeDeleted:
+        await call.message.edit_reply_markup(reply_markup=None)
+        logger.warning(
+            "Cannot delete message with medication card",
+            extra={"med_id": med_id, "user_id": user["id"]},
+        )
 
     delete_medication(med_id, user["id"])
     logger.info(
@@ -1491,7 +1524,11 @@ async def callback_snooze_option(call: types.CallbackQuery):
     snooze_intake(intake_id, minutes=minutes)
     METRICS["snoozes"] += 1
     await call.answer()
-    await call.message.edit_reply_markup(reply_markup=None)
+    chat_id = call.message.chat.id
+    prompt_id = SNOOZE_PROMPTS.pop(intake_id, None)
+    if prompt_id:
+        await safe_delete_message(chat_id, prompt_id)
+    await safe_delete_message(chat_id, call.message.message_id)
     await call.message.answer(
         f"Напомню про {med['name']} ({intake_time_local}) через {_format_minutes_label(minutes)} ⏰"
     )
@@ -1514,6 +1551,10 @@ async def callback_snooze_back(call: types.CallbackQuery):
     if not intake:
         await call.answer("Запись не найдена.", show_alert=True)
         return
+    chat_id = call.message.chat.id
+    prompt_id = SNOOZE_PROMPTS.pop(intake_id, None)
+    if prompt_id:
+        await safe_delete_message(chat_id, prompt_id)
     await call.answer()
     await call.message.edit_reply_markup(
         reply_markup=build_intake_action_keyboard(intake_id)
@@ -1685,9 +1726,14 @@ async def callback_intake_actions(call: types.CallbackQuery):
         await call.message.edit_reply_markup(
             reply_markup=build_snooze_options_keyboard(intake_id)
         )
-        await call.message.answer(
+        chat_id = call.message.chat.id
+        prompt_id = SNOOZE_PROMPTS.get(intake_id)
+        if prompt_id:
+            await safe_delete_message(chat_id, prompt_id)
+        prompt_msg = await call.message.answer(
             f"Через сколько минут напомнить про {med['name']} ({intake_time_local})?"
         )
+        SNOOZE_PROMPTS[intake_id] = prompt_msg.message_id
         return
 
     if action == "skip":
