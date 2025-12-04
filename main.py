@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone, time as dtime
@@ -47,6 +48,8 @@ except ZoneInfoNotFoundError:
 REMIND_BEFORE_MINUTES = int(os.getenv("REMIND_BEFORE_MINUTES", 10))
 SNOOZE_MINUTES = int(os.getenv("SNOOZE_MINUTES", 15))
 SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", 21))
+
+SNOOZE_CUSTOM_OPTIONS = [10, 20, 30, 40, 60, 120]
 
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 if ADMIN_CHAT_ID:
@@ -365,7 +368,14 @@ def format_intake_table(times: list[str], statuses: list[str]) -> str:
         statuses = ["—"]
     time_row = " | ".join(f"{t:^7}" for t in times)
     status_row = " | ".join(f"{s:^7}" for s in statuses)
-    return f"```\n{time_row}\n{status_row}\n```"
+    return f"{time_row}\n{status_row}"
+
+
+def _format_minutes_label(minutes: int) -> str:
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours} ч" if hours > 1 else "1 ч"
+    return f"{minutes} мин"
 
 
 def build_med_actions_keyboard(med: dict):
@@ -403,6 +413,23 @@ def build_pause_duration_keyboard(med_id: int):
         )
     keyboard.add(
         types.InlineKeyboardButton(text="↩️ Отмена", callback_data="close:pause_menu")
+    )
+    return keyboard
+
+
+def build_snooze_options_keyboard(intake_id: int):
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    for minutes in SNOOZE_CUSTOM_OPTIONS:
+        keyboard.insert(
+            types.InlineKeyboardButton(
+                text=_format_minutes_label(minutes),
+                callback_data=f"snoozeopt:{intake_id}:{minutes}",
+            )
+        )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="↩️ Назад", callback_data=f"snoozeback:{intake_id}"
+        )
     )
     return keyboard
 
@@ -1052,10 +1079,17 @@ async def cmd_list(message: types.Message):
                 status_line = f"Статус: ⏸ до {local_until}"
             else:
                 status_line = "Статус: ⏸ на паузе"
-        text = f"💊 *{med['name']}*\n{table}\n{summary}\n{status_line}"
+        text = "\n".join(
+            [
+                f"💊 <b>{html.escape(med['name'])}</b>",
+                f"<pre>{html.escape(table)}</pre>",
+                html.escape(summary),
+                html.escape(status_line),
+            ]
+        )
         await message.answer(
             text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=build_med_actions_keyboard(med),
         )
 
@@ -1098,10 +1132,14 @@ async def cmd_manage_meds(message: types.Message):
         intakes = get_intakes_for_day(med["id"], today_local, zone)
         total = len(intakes)
         taken = sum(1 for i in intakes if i["taken"])
-        display_times = [
-            to_local(i["scheduled_at"], zone).strftime("%H:%M") for i in intakes
-        ]
-        statuses = ["✅" if i["taken"] else "❌" for i in intakes]
+        if intakes:
+            display_times = [
+                to_local(i["scheduled_at"], zone).strftime("%H:%M") for i in intakes
+            ]
+            statuses = ["✅" if i["taken"] else "❌" for i in intakes]
+        else:
+            display_times = med["times"] or ["—"]
+            statuses = ["—"] * len(display_times)
         table = format_intake_table(display_times, statuses)
         if med["is_active"]:
             status_text = "🟢 Активно"
@@ -1110,14 +1148,16 @@ async def cmd_manage_meds(message: types.Message):
                 status_text = f"⏸ До {format_local_dt(med['paused_until'], zone)}"
             else:
                 status_text = "⏸ На паузе"
-        text = (
-            f"💊 *{med['name']}*\n"
-            f"{table}\n"
-            f"Сегодня: {taken}/{total}\n"
-            f"Статус: {status_text}"
+        text = "\n".join(
+            [
+                f"💊 <b>{html.escape(med['name'])}</b>",
+                f"<pre>{html.escape(table)}</pre>",
+                html.escape(f"Сегодня: {taken}/{total}"),
+                html.escape(f"Статус: {status_text}"),
+            ]
         )
         await message.answer(
-            text, parse_mode="Markdown", reply_markup=build_med_actions_keyboard(med)
+            text, parse_mode="HTML", reply_markup=build_med_actions_keyboard(med)
         )
 
 
@@ -1413,6 +1453,72 @@ async def callback_resume_med(call: types.CallbackQuery):
     )
 
 
+@dp.callback_query_handler(lambda c: c.data.startswith("snoozeopt:"))
+async def callback_snooze_option(call: types.CallbackQuery):
+    try:
+        _, intake_id_str, minutes_str = call.data.split(":")
+        intake_id = int(intake_id_str)
+        minutes = int(minutes_str)
+    except (ValueError, IndexError):
+        await call.answer("Неверные данные.", show_alert=True)
+        return
+
+    intake = db_query(
+        "SELECT * FROM intakes WHERE id = %s",
+        (intake_id,),
+        fetchone=True,
+    )
+    if not intake:
+        await call.answer("Запись не найдена.", show_alert=True)
+        return
+
+    med = get_med_by_id(intake["medication_id"])
+    if not med:
+        await call.answer("Лекарство не найдено.", show_alert=True)
+        return
+    if intake["taken"]:
+        await call.answer("Приём уже отмечен.", show_alert=True)
+        await call.message.edit_reply_markup(reply_markup=None)
+        return
+
+    user = get_user_by_id(med["user_id"])
+    if not user:
+        await call.answer("Пользователь не найден.", show_alert=True)
+        return
+
+    zone = get_zone_for_user(user)
+    intake_time_local = to_local(intake["scheduled_at"], zone).strftime("%H:%M")
+    snooze_intake(intake_id, minutes=minutes)
+    METRICS["snoozes"] += 1
+    await call.answer()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(
+        f"Напомню про {med['name']} ({intake_time_local}) через {_format_minutes_label(minutes)} ⏰"
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("snoozeback:"))
+async def callback_snooze_back(call: types.CallbackQuery):
+    try:
+        _, intake_id_str = call.data.split(":")
+        intake_id = int(intake_id_str)
+    except (ValueError, IndexError):
+        await call.answer("Неверные данные.", show_alert=True)
+        return
+
+    intake = db_query(
+        "SELECT * FROM intakes WHERE id = %s",
+        (intake_id,),
+        fetchone=True,
+    )
+    if not intake:
+        await call.answer("Запись не найдена.", show_alert=True)
+        return
+    await call.answer()
+    await call.message.edit_reply_markup(
+        reply_markup=build_intake_action_keyboard(intake_id)
+    )
+
 @dp.callback_query_handler(lambda c: c.data.startswith("med:toggle:"))
 async def callback_toggle_medication(call: types.CallbackQuery):
     _, _, med_id_str = call.data.split(":")
@@ -1575,11 +1681,12 @@ async def callback_intake_actions(call: types.CallbackQuery):
         if intake["taken"]:
             await call.answer("Приём уже отмечен.", show_alert=True)
             return
-        snooze_intake(intake_id)
-        METRICS["snoozes"] += 1
-        await call.answer()
+        await call.answer("Выбери интервал", show_alert=False)
+        await call.message.edit_reply_markup(
+            reply_markup=build_snooze_options_keyboard(intake_id)
+        )
         await call.message.answer(
-            f"Напомню про {med['name']} ({intake_time_local}) через {SNOOZE_MINUTES} минут ⏰"
+            f"Через сколько минут напомнить про {med['name']} ({intake_time_local})?"
         )
         return
 
