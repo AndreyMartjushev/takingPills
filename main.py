@@ -59,6 +59,7 @@ if ADMIN_CHAT_ID:
 MANUAL_MARK_BUTTON = "✅ Отметить приём"
 ADD_MED_BUTTON = "➕ Добавить лекарство"
 STATS_BUTTON = "📋 Список"
+CANCEL_BUTTON = "❌ Отмена"
 
 SCHEDULE_TYPE_EXACT = "exact"
 SCHEDULE_TYPE_PERIOD = "period"
@@ -289,7 +290,7 @@ def build_language_keyboard():
     return keyboard
 
 
-def get_main_reply_keyboard(has_medications: bool):
+def get_main_reply_keyboard(has_medications: bool, allow_cancel: bool = False):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if has_medications:
         keyboard.row(
@@ -299,6 +300,8 @@ def get_main_reply_keyboard(has_medications: bool):
     else:
         keyboard.add(types.KeyboardButton(STATS_BUTTON))
     keyboard.add(types.KeyboardButton(ADD_MED_BUTTON))
+    if allow_cancel:
+        keyboard.add(types.KeyboardButton(CANCEL_BUTTON))
     return keyboard
 
 
@@ -626,7 +629,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "/meds — управление лекарствами\n"
         "/timezone — сменить часовой пояс\n\n"
         f"Когда всё настроишь — пользуйся кнопкой \"{MANUAL_MARK_BUTTON}\" внизу, "
-        "если отметила приём заранее."
+        "если захотел отметить приём вручную."
     )
     await message.answer(text, reply_markup=get_main_reply_keyboard(has_meds))
     if not has_meds:
@@ -636,13 +639,47 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.message_handler(commands=["add"], state="*")
 async def cmd_add(message: types.Message, state: FSMContext):
-    get_or_create_user(message.from_user.id, message.from_user.first_name)
+    user = get_or_create_user(message.from_user.id, message.from_user.first_name)
+    has_meds = bool(get_user_medications(user["id"]))
     current_state = await state.get_state()
     if current_state:
         await state.finish()
     await AddMedStates.waiting_for_name.set()
     await state.update_data(times=[], periods=[])
-    await message.answer("Как называется лекарство?")
+    await message.answer(
+        "Как называется лекарство?",
+        reply_markup=get_main_reply_keyboard(has_meds, allow_cancel=True),
+    )
+
+
+async def _handle_cancel(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if not current_state or not current_state.startswith("AddMedStates"):
+        user = get_user_by_telegram(message.from_user.id)
+        has_meds = bool(user and get_user_medications(user["id"]))
+        await message.answer(
+            "Сейчас ничего не добавляем. Используй /add, когда будешь готов.",
+            reply_markup=get_main_reply_keyboard(has_meds),
+        )
+        return
+
+    await state.finish()
+    user = get_or_create_user(message.from_user.id, message.from_user.first_name)
+    has_meds = bool(get_user_medications(user["id"]))
+    await message.answer(
+        "Окей, остановил настройку. Что дальше?",
+        reply_markup=get_main_reply_keyboard(has_meds),
+    )
+
+
+@dp.message_handler(commands=["cancel"], state="*")
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    await _handle_cancel(message, state)
+
+
+@dp.message_handler(lambda message: message.text == CANCEL_BUTTON, state="*")
+async def handle_cancel_button(message: types.Message, state: FSMContext):
+    await _handle_cancel(message, state)
 
 
 @dp.message_handler(lambda message: message.text == ADD_MED_BUTTON, state="*")
@@ -876,7 +913,10 @@ async def add_more_medications(call: types.CallbackQuery, state: FSMContext):
     if choice == "yes":
         await AddMedStates.waiting_for_name.set()
         await state.update_data(times=[], periods=[], name=None, dose_count=None, schedule_mode=None)
-        await call.message.answer("Отлично! Как называется следующее лекарство?")
+        await call.message.answer(
+            "Отлично! Как называется следующее лекарство?",
+            reply_markup=get_main_reply_keyboard(has_meds, allow_cancel=True),
+        )
         return
 
     await state.finish()
@@ -905,24 +945,38 @@ async def cmd_list(message: types.Message):
     zone = get_zone_for_user(user)
     today_local = get_local_today(zone)
     now_utc = datetime.now(timezone.utc)
+    remind_before = get_remind_before(user)
     for med in meds:
         intakes = get_intakes_for_day(med["id"], today_local, zone)
         total = len(intakes)
         taken = sum(1 for i in intakes if i["taken"])
-        times_str = format_med_schedule(med)
         overdue = sum(
             1 for i in intakes if not i["taken"] and i["scheduled_at"] < now_utc
         )
-        lines.append(
-            f"💊 *{med['name']}*\n"
-            f"Время: {times_str}\n"
-            f"Сегодня: {taken}/{total}"
-        )
+        display_times = med["times"] or [
+            to_local(i["scheduled_at"], zone).strftime("%H:%M") for i in intakes
+        ]
+        if not display_times:
+            display_times = ["—"]
+        status_map = {
+            to_local(i["scheduled_at"], zone).strftime("%H:%M"): "✅"
+            if i["taken"]
+            else "❌"
+        }
+        time_row = " | ".join(f"{t:^5}" for t in display_times)
+        status_row = " | ".join(status_map.get(t, "❌").center(5) for t in display_times)
+        table = f"```\n{time_row}\n{status_row}\n```"
+        lines.append(f"💊 *{med['name']}*\n{table}")
+        summary = f"Сегодня: {taken}/{total}"
         if overdue:
-            lines.append(f"Просрочено: {overdue}")
+            summary += f" (просрочено {overdue})"
+        lines.append(summary)
         lines.append("")
 
-    lines.append(f"Часовой пояс: {user.get('timezone') or DEFAULT_TZ_NAME}")
+    lines.append(
+        f"Часовой пояс: {user.get('timezone') or DEFAULT_TZ_NAME}, "
+        f"напоминаю за {remind_before} мин."
+    )
     await message.answer(
         "\n".join(line for line in lines if line),
         parse_mode="Markdown",
@@ -1112,6 +1166,7 @@ async def callback_edit_medication(call: types.CallbackQuery, state: FSMContext)
         await call.answer("Лекарство не найдено.", show_alert=True)
         return
 
+    has_meds = bool(get_user_medications(user["id"]))
     await state.finish()
     await AddMedStates.waiting_for_times_per_day.set()
     await state.update_data(
@@ -1125,6 +1180,7 @@ async def callback_edit_medication(call: types.CallbackQuery, state: FSMContext)
         f"Обновим расписание для *{med['name']}*.\n"
         f"Сколько раз в день принимать? (сейчас {med.get('doses_per_day', len(med.get('times', [])))} раз)",
         parse_mode="Markdown",
+        reply_markup=get_main_reply_keyboard(has_meds, allow_cancel=True),
     )
 
 
@@ -1245,7 +1301,7 @@ async def cmd_stats(message: types.Message):
     await message.answer("\n".join(lines))
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("takeall:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("takeall:"), state="*")
 async def callback_take_all(call: types.CallbackQuery):
     _, med_id_str = call.data.split(":", 1)
     med_id = int(med_id_str)
@@ -1296,7 +1352,7 @@ async def cmd_daily(message: types.Message):
         await message.answer("На сегодня нет данных или всё ещё впереди ✨")
 # ----------------- Callback для отметки приёма -----------------
 @dp.callback_query_handler(
-    lambda c: c.data.startswith(("take:", "snooze:", "skip:"))
+    lambda c: c.data.startswith(("take:", "snooze:", "skip:")), state="*"
 )
 async def callback_intake_actions(call: types.CallbackQuery):
     try:
