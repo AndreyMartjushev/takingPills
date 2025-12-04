@@ -58,6 +58,7 @@ if ADMIN_CHAT_ID:
 
 MANUAL_MARK_BUTTON = "✅ Отметить приём"
 ADD_MED_BUTTON = "➕ Добавить лекарство"
+STATS_BUTTON = "📋 Список"
 
 SCHEDULE_TYPE_EXACT = "exact"
 SCHEDULE_TYPE_PERIOD = "period"
@@ -291,7 +292,12 @@ def build_language_keyboard():
 def get_main_reply_keyboard(has_medications: bool):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if has_medications:
-        keyboard.add(types.KeyboardButton(MANUAL_MARK_BUTTON))
+        keyboard.row(
+            types.KeyboardButton(MANUAL_MARK_BUTTON),
+            types.KeyboardButton(STATS_BUTTON),
+        )
+    else:
+        keyboard.add(types.KeyboardButton(STATS_BUTTON))
     keyboard.add(types.KeyboardButton(ADD_MED_BUTTON))
     return keyboard
 
@@ -578,7 +584,7 @@ def get_all_users():
 
 
 # ----------------- Клавиатуры -----------------
-def build_today_progress_keyboard(med, intakes, zone: ZoneInfo):
+def build_today_progress_keyboard(med, intakes, zone: ZoneInfo, *, include_mark_all=False):
     """
     Для inline-кнопки отметки приёма (используем только на напоминаниях)
     """
@@ -590,6 +596,13 @@ def build_today_progress_keyboard(med, intakes, zone: ZoneInfo):
             types.InlineKeyboardButton(
                 text=f"{time_str} {status}",
                 callback_data=f"take:{intake['id']}",
+            )
+        )
+    if include_mark_all and any(not intake["taken"] for intake in intakes):
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text="✅ Отметить все",
+                callback_data=f"takeall:{med['id']}",
             )
         )
     return keyboard
@@ -640,9 +653,12 @@ async def handle_add_button(message: types.Message, state: FSMContext):
 @dp.message_handler(lambda message: message.text == MANUAL_MARK_BUTTON, state="*")
 async def handle_manual_mark_button(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
-    if current_state and current_state.startswith("AddMedStates"):
-        await message.answer("Сначала закончи настройку лекарства.")
-        return
+    if current_state:
+        if current_state == AddMedStates.confirming_more.state:
+            await state.finish()
+        elif current_state.startswith("AddMedStates"):
+            await message.answer("Сначала закончи настройку лекарства.")
+            return
 
     user = get_user_by_telegram(message.from_user.id)
     if not user:
@@ -661,7 +677,7 @@ async def handle_manual_mark_button(message: types.Message, state: FSMContext):
         intakes = get_intakes_for_day(med["id"], today_local, zone)
         if not any(not intake["taken"] for intake in intakes):
             continue
-        keyboard = build_today_progress_keyboard(med, intakes, zone)
+        keyboard = build_today_progress_keyboard(med, intakes, zone, include_mark_all=True)
         await message.answer(
             f"💊 {med['name']}\nВыбери приём, который уже выполнен:",
             reply_markup=keyboard,
@@ -912,6 +928,11 @@ async def cmd_list(message: types.Message):
         parse_mode="Markdown",
         reply_markup=get_main_reply_keyboard(True),
     )
+
+
+@dp.message_handler(lambda message: message.text == STATS_BUTTON)
+async def handle_stats_button(message: types.Message):
+    await cmd_list(message)
 
 
 @dp.message_handler(commands=["help"])
@@ -1224,6 +1245,45 @@ async def cmd_stats(message: types.Message):
     await message.answer("\n".join(lines))
 
 
+@dp.callback_query_handler(lambda c: c.data.startswith("takeall:"))
+async def callback_take_all(call: types.CallbackQuery):
+    _, med_id_str = call.data.split(":", 1)
+    med_id = int(med_id_str)
+    med = get_med_by_id(med_id)
+    if not med:
+        await call.answer("Лекарство не найдено.", show_alert=True)
+        return
+
+    user = get_user_by_id(med["user_id"])
+    if not user:
+        await call.answer("Пользователь не найден.", show_alert=True)
+        return
+
+    zone = get_zone_for_user(user)
+    today_local = get_local_today(zone)
+    intakes = get_intakes_for_day(med_id, today_local, zone)
+    pending = [i for i in intakes if not i["taken"]]
+    if not pending:
+        await call.answer("Все приёмы уже отмечены ✅", show_alert=True)
+        await call.message.edit_reply_markup(
+            reply_markup=build_today_progress_keyboard(
+                med, intakes, zone, include_mark_all=False
+            )
+        )
+        return
+
+    for intake in pending:
+        mark_intake_taken(intake["id"])
+        METRICS["intakes_marked"] += 1
+
+    updated = get_intakes_for_day(med_id, today_local, zone)
+    keyboard = build_today_progress_keyboard(
+        med, updated, zone, include_mark_all=False
+    )
+    await call.message.edit_reply_markup(reply_markup=keyboard)
+    await call.answer("Отметил все приёмы для лекарства ✅", show_alert=True)
+
+
 @dp.message_handler(commands=["daily"])
 async def cmd_daily(message: types.Message):
     user = get_user_by_telegram(message.from_user.id)
@@ -1277,7 +1337,9 @@ async def callback_intake_actions(call: types.CallbackQuery):
         await call.answer("Отметил как принял(а) ✅", show_alert=True)
         intakes_today = get_intakes_for_day(med["id"], today_local, zone)
         if call.message and call.message.text and "Выбери приём" in call.message.text:
-            keyboard = build_today_progress_keyboard(med, intakes_today, zone)
+            keyboard = build_today_progress_keyboard(
+                med, intakes_today, zone, include_mark_all=True
+            )
             await call.message.edit_reply_markup(reply_markup=keyboard)
         else:
             await call.message.edit_reply_markup(reply_markup=None)
