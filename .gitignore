@@ -1,0 +1,27 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+
+# Logs / cache
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# Alembic or migration junk
+versions/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
