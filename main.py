@@ -4,7 +4,7 @@ import logging
 import os
 from datetime import date, datetime, timedelta, timezone, time as dtime
 from functools import lru_cache
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, Dispatcher, executor, types
@@ -129,6 +129,7 @@ METRICS = {
     "missed": 0,
 }
 SNOOZE_PROMPTS: Dict[int, int] = {}
+PAUSE_PROMPTS: Dict[Tuple[int, int], int] = {}
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -431,7 +432,9 @@ def build_pause_duration_keyboard(med_id: int):
             )
         )
     keyboard.add(
-        types.InlineKeyboardButton(text="↩️ Отмена", callback_data="close:pause_menu")
+        types.InlineKeyboardButton(
+            text="↩️ Отмена", callback_data=f"close:pause_menu:{med_id}"
+        )
     )
     return keyboard
 
@@ -1392,10 +1395,18 @@ async def callback_delete_confirm(call: types.CallbackQuery):
         reply_markup=get_main_reply_keyboard(has_meds),
     )
 
-@dp.callback_query_handler(lambda c: c.data == "close:pause_menu", state="*")
+@dp.callback_query_handler(lambda c: c.data.startswith("close:pause_menu"), state="*")
 async def callback_close_pause(call: types.CallbackQuery):
+    parts = call.data.split(":")
+    med_id = int(parts[-1]) if len(parts) > 2 else None
     await call.answer()
-    await call.message.edit_reply_markup(reply_markup=None)
+    chat_id = call.message.chat.id
+    await safe_delete_message(chat_id, call.message.message_id)
+    if med_id is not None:
+        key = (call.from_user.id, med_id)
+        prompt_id = PAUSE_PROMPTS.pop(key, None)
+        if prompt_id:
+            await safe_delete_message(chat_id, prompt_id)
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("med:pauseprompt:"), state="*")
@@ -1414,11 +1425,17 @@ async def callback_pause_prompt(call: types.CallbackQuery):
         await call.answer("Лекарство уже на паузе.", show_alert=True)
         return
     await call.answer()
-    await call.message.answer(
+    chat_id = call.message.chat.id
+    key = (call.from_user.id, med_id)
+    existing = PAUSE_PROMPTS.get(key)
+    if existing:
+        await safe_delete_message(chat_id, existing)
+    prompt = await call.message.answer(
         f"На сколько поставить *{med['name']}* на паузу?",
         parse_mode="Markdown",
         reply_markup=build_pause_duration_keyboard(med_id),
     )
+    PAUSE_PROMPTS[key] = prompt.message_id
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("med:pause:"), state="*")
@@ -1450,6 +1467,12 @@ async def callback_pause_med(call: types.CallbackQuery):
         extra={"med_id": med_id, "user_id": user["id"], "until": until.isoformat()},
     )
     await call.answer()
+    chat_id = call.message.chat.id
+    key = (call.from_user.id, med_id)
+    prompt_id = PAUSE_PROMPTS.pop(key, None)
+    if prompt_id:
+        await safe_delete_message(chat_id, prompt_id)
+    await safe_delete_message(chat_id, call.message.message_id)
     zone = get_zone_for_user(user)
     await call.message.answer(
         f"Поставил *{med['name']}* на паузу на {label} (до {format_local_dt(until, zone)}).\n"
