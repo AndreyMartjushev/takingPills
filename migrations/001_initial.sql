@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS users (
     first_name TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     timezone TEXT NOT NULL DEFAULT 'UTC',
-    language TEXT NOT NULL DEFAULT 'ru'
+    language TEXT NOT NULL DEFAULT 'ru',
+    remind_before_minutes INT NOT NULL DEFAULT 10
 );
 
 CREATE TABLE IF NOT EXISTS medications (

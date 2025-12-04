@@ -82,6 +82,7 @@ HELP_TEXTS = {
         "/list — список и прогресс на сегодня\n"
         "/meds — изменить расписание, паузу или удалить\n"
         "/timezone — сменить часовой пояс\n"
+        "/remind — настроить, за сколько минут напоминать\n"
         "/daily — прислать сводку за сегодня\n"
         "/language — выбрать язык\n"
         "/stats — метрики (для администратора)\n\n"
@@ -93,6 +94,7 @@ HELP_TEXTS = {
         "/list — show today's progress\n"
         "/meds — manage schedule / pause / delete\n"
         "/timezone — change timezone\n"
+        "/remind — configure reminder lead time\n"
         "/daily — send today's summary\n"
         "/language — pick interface language\n"
         "/stats — metrics (admin only)\n\n"
@@ -122,6 +124,7 @@ class AddMedStates(StatesGroup):
     waiting_for_schedule_type = State()
     waiting_for_exact_time = State()
     waiting_for_day_period = State()
+    waiting_for_remind_before = State()
     confirming_more = State()
 
 
@@ -151,6 +154,14 @@ def resolve_timezone(tz_name: Optional[str]) -> ZoneInfo:
 
 def get_zone_for_user(user: dict) -> ZoneInfo:
     return resolve_timezone(user.get("timezone"))
+
+
+def get_remind_before(user: dict) -> int:
+    try:
+        value = int(user.get("remind_before_minutes", REMIND_BEFORE_MINUTES))
+        return max(1, min(180, value))
+    except (TypeError, ValueError):
+        return REMIND_BEFORE_MINUTES
 
 
 def get_language_for_user(user: dict) -> str:
@@ -334,10 +345,10 @@ def get_or_create_user(telegram_id: int, first_name: str = None):
 
     db_query(
         """
-        INSERT INTO users (telegram_id, first_name, timezone, language)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO users (telegram_id, first_name, timezone, language, remind_before_minutes)
+        VALUES (%s, %s, %s, %s, %s)
         """,
-        (telegram_id, first_name, DEFAULT_TZ_NAME, "ru"),
+        (telegram_id, first_name, DEFAULT_TZ_NAME, "ru", REMIND_BEFORE_MINUTES),
     )
     user = db_query(
         "SELECT * FROM users WHERE telegram_id = %s",
@@ -515,6 +526,14 @@ def update_user_language(user_id: int, lang_code: str):
     db_query(
         "UPDATE users SET language = %s WHERE id = %s",
         (lang_code, user_id),
+    )
+
+
+def update_user_remind_before(user_id: int, minutes: int):
+    minutes = max(1, min(180, minutes))
+    db_query(
+        "UPDATE users SET remind_before_minutes = %s WHERE id = %s",
+        (minutes, user_id),
     )
 
 
@@ -801,6 +820,24 @@ async def finalize_medication_entry(source_message: types.Message, state: FSMCon
         )
         return
 
+    await AddMedStates.waiting_for_remind_before.set()
+    await source_message.answer(
+        "За сколько минут заранее напоминать? (1-180)",
+    )
+
+
+@dp.message_handler(state=AddMedStates.waiting_for_remind_before)
+async def set_remind_before(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    user = get_or_create_user(message.from_user.id, message.from_user.first_name)
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("Нужна цифра (минуты). Например: 10")
+        return
+    minutes = max(1, min(180, int(raw)))
+    update_user_remind_before(user["id"], minutes)
+    await message.answer(f"Буду напоминать за {minutes} минут до приёма 💊")
+
     await state.update_data(times=[], periods=[], edit_med_id=None)
     await AddMedStates.confirming_more.set()
     await source_message.answer(
@@ -966,6 +1003,37 @@ async def cmd_timezone(message: types.Message):
     update_user_timezone(user["id"], tz_name)
     await message.answer(
         f"Готово! Теперь часовой пояс: {tz_name}",
+        reply_markup=get_main_reply_keyboard(has_meds),
+    )
+
+
+@dp.message_handler(commands=["remind"], state="*")
+async def cmd_remind(message: types.Message):
+    user = get_or_create_user(message.from_user.id, message.from_user.first_name)
+    has_meds = bool(get_user_medications(user["id"]))
+
+    args = (message.get_args() or "").strip()
+    if not args:
+        await message.answer(
+            f"Сейчас напоминаю за {get_remind_before(user)} минут.\n"
+            "Введи `/remind 15`, чтобы изменить.",
+            parse_mode="Markdown",
+            reply_markup=get_main_reply_keyboard(has_meds),
+        )
+        return
+
+    if not args.isdigit():
+        await message.answer(
+            "Нужна цифра в минутах, например `/remind 20`.",
+            parse_mode="Markdown",
+            reply_markup=get_main_reply_keyboard(has_meds),
+        )
+        return
+
+    minutes = max(1, min(180, int(args)))
+    update_user_remind_before(user["id"], minutes)
+    await message.answer(
+        f"Буду напоминать за {minutes} минут.",
         reply_markup=get_main_reply_keyboard(has_meds),
     )
 
@@ -1260,6 +1328,7 @@ async def check_and_send_reminders():
         if not user:
             continue
         zone = get_zone_for_user(user)
+        remind_before = get_remind_before(user)
         today_local = get_local_today(zone)
 
         for day_offset in range(0, 2):
@@ -1268,7 +1337,7 @@ async def check_and_send_reminders():
             for t_str in med["times"] or []:
                 scheduled_dt = local_time_to_utc(target_date, t_str, zone)
                 default_reminder_at = scheduled_dt - timedelta(
-                    minutes=REMIND_BEFORE_MINUTES
+                    minutes=remind_before
                 )
                 if day_offset == 0 and default_reminder_at < now_utc:
                     default_reminder_at = now_utc
