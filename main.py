@@ -49,7 +49,7 @@ except ZoneInfoNotFoundError:
 
 REMIND_BEFORE_MINUTES = int(os.getenv("REMIND_BEFORE_MINUTES", 10))
 SNOOZE_MINUTES = int(os.getenv("SNOOZE_MINUTES", 15))
-SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", 21))
+SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", 23))
 
 SNOOZE_CUSTOM_OPTIONS = [10, 20, 30, 40, 60, 120]
 
@@ -144,8 +144,15 @@ class AddMedStates(StatesGroup):
     waiting_for_schedule_type = State()
     waiting_for_exact_time = State()
     waiting_for_day_period = State()
+    waiting_for_pills_per_dose = State()
+    waiting_for_stock_total = State()
     waiting_for_remind_before = State()
     confirming_more = State()
+
+
+class AdjustMedStates(StatesGroup):
+    waiting_for_pills_per_dose = State()
+    waiting_for_stock_total = State()
 
 
 # ----------------- Работа со временем -----------------
@@ -391,6 +398,28 @@ def format_intake_table(times: list[str], statuses: list[str]) -> str:
     return f"{time_row}\n{status_row}"
 
 
+def format_stock_status(med: dict) -> str:
+    stock = med.get("stock_total")
+    if stock is None:
+        stock = 0
+    pills_per_dose = max(0, med.get("pills_per_dose") or 0)
+    base = f"Остаток: {stock} шт"
+    if pills_per_dose > 0:
+        base += f", по {pills_per_dose} шт за приём"
+        doses_per_day = med.get("doses_per_day") or len(med.get("times") or [])
+        doses_per_day = max(1, doses_per_day)
+        per_day = pills_per_dose * doses_per_day
+        if per_day > 0:
+            days_left = stock // per_day
+            if days_left > 0:
+                base += f", хватит примерно на {days_left} дн."
+            elif stock > 0:
+                base += ", хватит меньше чем на день"
+            else:
+                base += ", таблетки закончились"
+    return base
+
+
 def _format_minutes_label(minutes: int) -> str:
     if minutes % 60 == 0:
         hours = minutes // 60
@@ -406,6 +435,14 @@ def build_med_actions_keyboard(med: dict):
         ),
         types.InlineKeyboardButton(
             text="🗑 Удалить", callback_data=f"med:delete:{med['id']}"
+        ),
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="⚙️ Доза", callback_data=f"med:editdose:{med['id']}"
+        ),
+        types.InlineKeyboardButton(
+            text="📦 Остаток", callback_data=f"med:editstock:{med['id']}"
         ),
     )
     if med["is_active"]:
@@ -489,15 +526,18 @@ def add_medication(
     schedule_mode: str = SCHEDULE_TYPE_EXACT,
     periods: Optional[list[str]] = None,
     doses_per_day: Optional[int] = None,
+    pills_per_dose: int = 1,
+    stock_total: int = 0,
 ):
     # times_list: список строк 'HH:MM'
     doses = doses_per_day or len(times_list)
     db_query(
         """
-        INSERT INTO medications (user_id, name, times, schedule_mode, periods, doses_per_day)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO medications
+            (user_id, name, times, schedule_mode, periods, doses_per_day, pills_per_dose, stock_total, low_stock_notified)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE)
         """,
-        (user_id, name, times_list, schedule_mode, periods, doses),
+        (user_id, name, times_list, schedule_mode, periods, doses, pills_per_dose, stock_total),
     )
 
 
@@ -610,6 +650,44 @@ def set_medication_active(
          WHERE id = %s AND user_id = %s
         """,
         (active, None if active else paused_until, med_id, user_id),
+    )
+
+
+def update_medication_pills_per_dose(med_id: int, user_id: int, pills_per_dose: int):
+    db_query(
+        """
+        UPDATE medications
+           SET pills_per_dose = %s
+         WHERE id = %s AND user_id = %s
+        """,
+        (pills_per_dose, med_id, user_id),
+    )
+
+
+def update_medication_stock_total(
+    med_id: int, user_id: int, stock_total: int, *, reset_notification: bool = True
+):
+    db_query(
+        """
+        UPDATE medications
+           SET stock_total = %s,
+               low_stock_notified = CASE WHEN %s THEN FALSE ELSE low_stock_notified END
+         WHERE id = %s AND user_id = %s
+        """,
+        (stock_total, reset_notification, med_id, user_id),
+    )
+
+
+def decrease_medication_stock(med_id: int, pills_per_dose: int):
+    if pills_per_dose <= 0:
+        return
+    db_query(
+        """
+        UPDATE medications
+           SET stock_total = GREATEST(stock_total - %s, 0)
+         WHERE id = %s
+        """,
+        (pills_per_dose, med_id),
     )
 
 
@@ -775,7 +853,9 @@ async def cmd_add(message: types.Message, state: FSMContext):
 
 async def _handle_cancel(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
-    if not current_state or not current_state.startswith("AddMedStates"):
+    if not current_state or not (
+        current_state.startswith("AddMedStates") or current_state.startswith("AdjustMedStates")
+    ):
         user = get_user_by_telegram(message.from_user.id)
         has_meds = bool(user and get_user_medications(user["id"]))
         await message.answer(
@@ -952,6 +1032,86 @@ async def add_period_time(call: types.CallbackQuery, state: FSMContext):
         await finalize_medication_entry(call.message, state)
 
 
+@dp.message_handler(
+    state=[
+        AddMedStates.waiting_for_pills_per_dose,
+        AdjustMedStates.waiting_for_pills_per_dose,
+    ]
+)
+async def handle_pills_per_dose_input(message: types.Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("Нужна цифра, например 1.")
+        return
+    value = max(1, min(50, int(raw)))
+    current_state = await state.get_state()
+    if current_state and current_state.startswith("AdjustMedStates"):
+        data = await state.get_data()
+        med_id = data.get("adjust_med_id")
+        user = get_user_by_telegram(message.from_user.id)
+        if not user or not med_id:
+            await message.answer("Не удалось определить лекарство.")
+            await state.finish()
+            return
+        update_medication_pills_per_dose(med_id, user["id"], value)
+        await state.finish()
+        await message.answer(
+            f"Теперь принимаем по {value} шт за раз.",
+            reply_markup=get_main_reply_keyboard(bool(get_user_medications(user["id"]))),
+        )
+        return
+
+    data = await state.get_data()
+    pending = data.get("pending_med")
+    if not pending:
+        await message.answer("Не нашёл данные лекарства, начни /add заново.")
+        await state.finish()
+        return
+    pending["pills_per_dose"] = value
+    await state.update_data(pending_med=pending)
+    await AddMedStates.waiting_for_stock_total.set()
+    await message.answer("Сколько таблеток сейчас есть в запасе? (например, 30)")
+
+
+@dp.message_handler(
+    state=[
+        AddMedStates.waiting_for_stock_total,
+        AdjustMedStates.waiting_for_stock_total,
+    ]
+)
+async def handle_stock_total_input(message: types.Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("Нужно целое число, например 20.")
+        return
+    stock = max(0, int(raw))
+    current_state = await state.get_state()
+    if current_state and current_state.startswith("AdjustMedStates"):
+        data = await state.get_data()
+        med_id = data.get("adjust_med_id")
+        user = get_user_by_telegram(message.from_user.id)
+        if not user or not med_id:
+            await message.answer("Не удалось определить лекарство.")
+            await state.finish()
+            return
+        update_medication_stock_total(med_id, user["id"], stock)
+        await state.finish()
+        await message.answer(
+            f"Остаток обновлён: {stock} шт.",
+            reply_markup=get_main_reply_keyboard(bool(get_user_medications(user["id"]))),
+        )
+        return
+
+    data = await state.get_data()
+    pending = data.get("pending_med")
+    if not pending:
+        await message.answer("Не нашёл данные лекарства, начни /add заново.")
+        await state.finish()
+        return
+    pills_per_dose = pending.get("pills_per_dose", 1)
+    await _create_medication_from_pending(message, state, pills_per_dose, stock)
+
+
 async def finalize_medication_entry(source_message: types.Message, state: FSMContext):
     data = await state.get_data()
     name = data["name"]
@@ -973,15 +1133,6 @@ async def finalize_medication_entry(source_message: types.Message, state: FSMCon
             doses_per_day=dose_count,
         )
         clear_future_intakes(edit_med_id)
-    else:
-        add_medication(
-            user["id"],
-            name,
-            times,
-            schedule_mode=schedule_mode,
-            periods=periods,
-            doses_per_day=dose_count,
-        )
     pretty_times = []
     if periods:
         for idx, t in enumerate(times):
@@ -993,9 +1144,8 @@ async def finalize_medication_entry(source_message: types.Message, state: FSMCon
         f"Лекарство *{name}* {'обновлено' if edit_med_id else 'добавлено'}.\n"
         f"Расписание: {', '.join(pretty_times)}"
     )
-    await source_message.answer(summary, parse_mode="Markdown")
-
     if edit_med_id:
+        await source_message.answer(summary, parse_mode="Markdown")
         await state.finish()
         has_meds = bool(get_user_medications(user["id"]))
         await source_message.answer(
@@ -1004,10 +1154,54 @@ async def finalize_medication_entry(source_message: types.Message, state: FSMCon
         )
         return
 
-    await AddMedStates.waiting_for_remind_before.set()
+    pending = {
+        "user_id": user["id"],
+        "name": name,
+        "times": times,
+        "schedule_mode": schedule_mode,
+        "periods": periods,
+        "doses_per_day": dose_count,
+        "pretty_times": pretty_times,
+    }
+    await state.update_data(
+        pending_med=pending,
+        times=[],
+        periods=[],
+    )
+    await AddMedStates.waiting_for_pills_per_dose.set()
     await source_message.answer(
+        "Сколько таблеток принимать за один приём? (число от 1 до 10)",
+    )
+
+
+async def _create_medication_from_pending(message: types.Message, state: FSMContext, pills_per_dose: int, stock_total: int):
+    data = await state.get_data()
+    pending = data.get("pending_med")
+    if not pending:
+        await message.answer("Что-то пошло не так, попробуй /add сначала.")
+        await state.finish()
+        return
+    add_medication(
+        pending["user_id"],
+        pending["name"],
+        pending["times"],
+        schedule_mode=pending.get("schedule_mode", SCHEDULE_TYPE_EXACT),
+        periods=pending.get("periods"),
+        doses_per_day=pending.get("doses_per_day"),
+        pills_per_dose=pills_per_dose,
+        stock_total=stock_total,
+    )
+    summary = (
+        f"Лекарство *{pending['name']}* добавлено.\n"
+        f"Расписание: {', '.join(pending.get('pretty_times', []))}\n"
+        f"Доза: {pills_per_dose} шт, остаток: {stock_total} шт"
+    )
+    await message.answer(summary, parse_mode="Markdown")
+    await AddMedStates.waiting_for_remind_before.set()
+    await message.answer(
         "За сколько минут заранее напоминать? (1-180)",
     )
+    await state.update_data(pending_med=None)
 
 
 @dp.message_handler(state=AddMedStates.waiting_for_remind_before)
@@ -1024,7 +1218,7 @@ async def set_remind_before(message: types.Message, state: FSMContext):
 
     await state.update_data(times=[], periods=[], edit_med_id=None)
     await AddMedStates.confirming_more.set()
-    await source_message.answer(
+    await message.answer(
         "Добавим ещё лекарство?", reply_markup=build_add_more_keyboard()
     )
 
@@ -1110,11 +1304,13 @@ async def send_list_overview(message: types.Message):
                 status_line = f"Статус: ⏸ до {local_until}"
             else:
                 status_line = "Статус: ⏸ на паузе"
+        stock_line = format_stock_status(med)
         text = "\n".join(
             [
                 f"💊 <b>{html.escape(med['name'])}</b>",
                 f"<pre>{html.escape(table)}</pre>",
                 html.escape(summary),
+                html.escape(stock_line),
                 html.escape(status_line),
             ]
         )
@@ -1174,11 +1370,13 @@ async def cmd_manage_meds(message: types.Message):
                 status_text = f"⏸ До {format_local_dt(med['paused_until'], zone)}"
             else:
                 status_text = "⏸ На паузе"
+        stock_line = format_stock_status(med)
         text = "\n".join(
             [
                 f"💊 <b>{html.escape(med['name'])}</b>",
                 f"<pre>{html.escape(table)}</pre>",
                 html.escape(f"Сегодня: {taken}/{total}"),
+                html.escape(stock_line),
                 html.escape(f"Статус: {status_text}"),
             ]
         )
@@ -1393,6 +1591,60 @@ async def callback_delete_confirm(call: types.CallbackQuery):
         f"Удалил *{med['name']}*.",
         parse_mode="Markdown",
         reply_markup=get_main_reply_keyboard(has_meds),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("med:editdose:"), state="*")
+async def callback_edit_dose(call: types.CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state and current_state.startswith("AddMedStates"):
+        await call.answer("Сначала закончи настройку лекарства.", show_alert=True)
+        return
+    _, _, med_id_str = call.data.split(":")
+    med_id = int(med_id_str)
+    user = get_user_by_telegram(call.from_user.id)
+    if not user:
+        await call.answer("Сначала отправь /start", show_alert=True)
+        return
+    med = get_med_by_id(med_id)
+    if not med or med["user_id"] != user["id"]:
+        await call.answer("Лекарство не найдено.", show_alert=True)
+        return
+    if current_state:
+        await state.finish()
+    await AdjustMedStates.waiting_for_pills_per_dose.set()
+    await state.update_data(adjust_med_id=med_id)
+    await call.answer()
+    await call.message.answer(
+        f"Сколько таблеток за один приём для *{med['name']}*? (сейчас {med.get('pills_per_dose', 1)} шт)",
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("med:editstock:"), state="*")
+async def callback_edit_stock(call: types.CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state and current_state.startswith("AddMedStates"):
+        await call.answer("Сначала закончи настройку лекарства.", show_alert=True)
+        return
+    _, _, med_id_str = call.data.split(":")
+    med_id = int(med_id_str)
+    user = get_user_by_telegram(call.from_user.id)
+    if not user:
+        await call.answer("Сначала отправь /start", show_alert=True)
+        return
+    med = get_med_by_id(med_id)
+    if not med or med["user_id"] != user["id"]:
+        await call.answer("Лекарство не найдено.", show_alert=True)
+        return
+    if current_state:
+        await state.finish()
+    await AdjustMedStates.waiting_for_stock_total.set()
+    await state.update_data(adjust_med_id=med_id)
+    await call.answer()
+    await call.message.answer(
+        f"Сколько таблеток осталось по *{med['name']}*? (сейчас {med.get('stock_total', 0)} шт)",
+        parse_mode="Markdown",
     )
 
 @dp.callback_query_handler(lambda c: c.data.startswith("close:pause_menu"), state="*")
@@ -1662,8 +1914,10 @@ async def callback_take_all(call: types.CallbackQuery):
         await call.message.answer(f"Все приёмы для {med['name']} уже отмечены ✅")
         return
 
+    pills_per_dose = med.get("pills_per_dose") or 0
     for intake in pending:
         mark_intake_taken(intake["id"])
+        decrease_medication_stock(med_id, pills_per_dose)
         METRICS["intakes_marked"] += 1
 
     updated = get_intakes_for_day(med_id, today_local, zone)
@@ -1725,6 +1979,7 @@ async def callback_intake_actions(call: types.CallbackQuery):
             await call.answer("Уже отмечено как принял(а) ✅", show_alert=True)
             return
         mark_intake_taken(intake_id)
+        decrease_medication_stock(med["id"], med.get("pills_per_dose") or 0)
         METRICS["intakes_marked"] += 1
         await call.answer()
         await call.message.answer(
@@ -1776,6 +2031,7 @@ async def reminder_loop():
         try:
             await resume_due_medications()
             await check_and_send_reminders()
+            await check_low_stock_alerts()
         except Exception as e:
             logger.exception("Error in reminder_loop: %s", e)
             await notify_admin("Фоновый цикл напоминаний упал")
@@ -1902,6 +2158,59 @@ async def check_and_send_reminders():
                         METRICS["reminders_failed"] += 1
                         logger.exception("Failed to send reminder: %s", e)
                         await notify_admin(f"Не смог отправить напоминание пользователю {user['id']}")
+
+
+async def check_low_stock_alerts():
+    meds = db_query(
+        """
+        SELECT m.id,
+               m.name,
+               m.user_id,
+               m.stock_total,
+               m.pills_per_dose,
+               m.doses_per_day,
+               u.telegram_id
+          FROM medications m
+          JOIN users u ON u.id = m.user_id
+         WHERE m.low_stock_notified = FALSE
+           AND m.pills_per_dose > 0
+        """,
+        fetchall=True,
+    ) or []
+    for med in meds:
+        pills_per_dose = max(1, med.get("pills_per_dose") or 1)
+        doses_per_day = med.get("doses_per_day") or 0
+        if doses_per_day <= 0:
+            doses_per_day = 1
+        per_day = pills_per_dose * doses_per_day
+        threshold = per_day * 2
+        stock_total = med.get("stock_total") or 0
+        if per_day <= 0 or stock_total > threshold:
+            continue
+        days_left = stock_total // per_day if per_day else 0
+        if days_left > 0:
+            tail = f"Хватит примерно на {days_left} дн."
+        elif stock_total > 0:
+            tail = "Хватит меньше чем на день."
+        else:
+            tail = "Таблетки закончились."
+        text = (
+            f"⚠️ Таблетки *{med['name']}* заканчиваются.\n"
+            f"Осталось {stock_total} шт (по {pills_per_dose} шт за приём). {tail}"
+        )
+        try:
+            await bot.send_message(med["telegram_id"], text, parse_mode="Markdown")
+        except Exception as exc:
+            logger.warning(
+                "Failed to send low stock alert",
+                exc_info=exc,
+                extra={"med_id": med["id"], "user_id": med["user_id"]},
+            )
+            continue
+        db_query(
+            "UPDATE medications SET low_stock_notified = TRUE WHERE id = %s",
+            (med["id"],),
+        )
 
 
 async def send_summary_for_user(user: dict) -> bool:

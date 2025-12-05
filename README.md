@@ -50,6 +50,7 @@
 - `002_add_language.sql` — добавляет колонку `language` в `users`.
 - `003_add_remind_before.sql` — добавляет настройку `remind_before_minutes`.
 - `004_add_paused_until.sql` — даёт `medications` дату автоматического возобновления курса (`paused_until`).
+- `005_add_pill_stock.sql` — добавляет дозировку, остаток и флаг уведомления (`pills_per_dose`, `stock_total`, `low_stock_notified`).
 
 ## Основные возможности
 

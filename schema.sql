@@ -17,6 +17,9 @@ CREATE TABLE IF NOT EXISTS medications (
     schedule_mode TEXT NOT NULL DEFAULT 'exact',
     periods TEXT[],
     is_active BOOLEAN DEFAULT TRUE,
+    pills_per_dose INT NOT NULL DEFAULT 1,
+    stock_total INT NOT NULL DEFAULT 0,
+    low_stock_notified BOOLEAN NOT NULL DEFAULT FALSE,
     paused_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
